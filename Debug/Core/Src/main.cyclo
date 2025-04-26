@@ -1,0 +1,13 @@
+../Core/Src/main.c:52:5:main	1
+../Core/Src/main.c:87:6:Parse_Command	3
+../Core/Src/main.c:117:6:Start_Stepper	1
+../Core/Src/main.c:147:10:RPM_To_Period	1
+../Core/Src/main.c:154:6:HAL_TIM_PeriodElapsedCallback	4
+../Core/Src/main.c:184:6:TIM3_IRQHandler	1
+../Core/Src/main.c:189:6:HAL_UART_RxCpltCallback	5
+../Core/Src/main.c:218:6:SystemClock_Config	3
+../Core/Src/main.c:266:13:MX_TIM2_Init	4
+../Core/Src/main.c:306:13:MX_TIM3_Init	4
+../Core/Src/main.c:345:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:368:13:MX_GPIO_Init	1
+../Core/Src/main.c:401:6:Error_Handler	1
