@@ -139,14 +139,15 @@ void Start_Stepper(uint32_t steps, uint32_t rpm, uint32_t direction)
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   HAL_TIM_Base_Start_IT(&htim3);
 
-  total_steps = steps;
+  total_steps = steps * 2;
   step_count = 0;
   isMoving = true;
 }
 
 uint32_t RPM_To_Period(uint32_t rpm)
 {
-  uint32_t steps_per_sec = (rpm * 200) / 60;
+  // Use 1600 steps per revolution for 1/8 microstepping
+  uint32_t steps_per_sec = (rpm * 1600) / 60;
   uint32_t timer_clk = 72000000 / 72;
   return timer_clk / (steps_per_sec * 2); // *2 for HIGH and LOW
 }
