@@ -36,6 +36,7 @@ extern "C" {
 #include <stdio.h>
 
 /* USER CODE END Includes */
+#include "motion_phase.h"
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */

@@ -26,7 +26,21 @@ UART_HandleTypeDef huart2;
 volatile uint32_t step_count = 0;
 volatile uint32_t total_steps = 0;
 volatile bool isMoving = false;
+volatile bool isSoftStopRequested = false;
+
+volatile bool command_ready = false;
 uint32_t step_period = 1000; // default period
+
+// State Machine Decleration
+MotionPhase motion_phase = MOTION_IDLE;
+
+// Acceleration and Deceleration Setup
+uint32_t accel_steps = 0;
+uint32_t decel_steps = 0;
+uint32_t const_steps = 0;
+uint32_t target_rpm = 0;
+uint32_t max_step_period = 10000;  // slowest
+uint32_t min_step_period = 1000;   // fastest
 
 // Motion Time Timestamps
 volatile uint32_t step_start_time = 0;
@@ -42,8 +56,9 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 void Parse_Command(char *cmd);
-void Start_Stepper(uint32_t steps, uint32_t rpm, uint32_t direction);
+void Start_Stepper_With_Profile(uint32_t steps, uint32_t rpm, uint32_t direction);
 uint32_t RPM_To_Period(uint32_t rpm);
+uint32_t Calculate_Step_Period(uint32_t step_num);
 
 /**
   * @brief  The application entry point.
@@ -78,9 +93,11 @@ int main(void)
 
   while (1)
   {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
+    if (command_ready)
+    {
+      command_ready = false;
+      Parse_Command(rx_buffer);
+    }
   }
 }
 
@@ -92,6 +109,42 @@ void Parse_Command(char *cmd)
   snprintf(dbg, sizeof(dbg), "Received: %s\r\n", cmd);
   HAL_UART_Transmit(&huart2, (uint8_t *)dbg, strlen(dbg), HAL_MAX_DELAY);
 
+  // Check for Stop Soft (SS) or Stop Hard (SH)
+  if (strcmp(cmd, "SS") == 0)
+  {
+    if (isMoving)
+    {
+      isSoftStopRequested = true;
+      char msg[] = "SS Acknowledged\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+    else
+    {
+      char msg[] = "SS Ignored: Not moving\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+    return;
+  }
+
+  if (strcmp(cmd, "SH") == 0)
+  {
+    if (isMoving)
+    {
+      isMoving = false;
+      HAL_TIM_Base_Stop_IT(&htim3);   // Stop profile timer
+      HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1); // Stop motor pulses
+      char msg[] = "SH Acknowledged\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+    else
+    {
+      char msg[] = "SH Ignored: Not moving\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+    return;
+  }
+
+  // Normal move command
   if (sscanf(cmd, "M:%lu,%lu,%lu", &steps, &rpm, &dir) == 3)
   {
     snprintf(dbg, sizeof(dbg), "Parsed steps: %lu, rpm: %lu, dir: %lu\r\n", steps, rpm, dir);
@@ -99,7 +152,7 @@ void Parse_Command(char *cmd)
 
     if (!isMoving)
     {
-      Start_Stepper(steps, rpm, dir);
+      Start_Stepper_With_Profile(steps, rpm, dir);
     }
     else
     {
@@ -113,37 +166,38 @@ void Parse_Command(char *cmd)
     HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
   }
 }
-
-void Start_Stepper(uint32_t steps, uint32_t rpm, uint32_t direction)
+void Start_Stepper_With_Profile(uint32_t steps, uint32_t rpm, uint32_t direction)
 {
-  step_period = RPM_To_Period(rpm);
+  target_rpm = rpm;
+  min_step_period = RPM_To_Period(rpm);
+  max_step_period = min_step_period * 4; // start slow, arbitrary factor
 
-  // Set DIR pin
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, direction ? GPIO_PIN_SET : GPIO_PIN_RESET);
-
-  // Stop PWM before reconfiguring
-  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
-
-  // Update ARR and CCR for TIM2
-  __HAL_TIM_SET_AUTORELOAD(&htim2, step_period - 1);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (step_period - 1) / 2);  // 50% duty
-
-  // Update ARR for TIM3 (same period)
-  __HAL_TIM_SET_AUTORELOAD(&htim3, step_period - 1);
-  __HAL_TIM_SET_COUNTER(&htim3, 0);
-
-  // Record start time in milliseconds
-  step_start_time = HAL_GetTick();
-
-  // Start both PWM and interrupt timer
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_Base_Start_IT(&htim3);
+  accel_steps = steps / 32;
+  decel_steps = steps / 32;
+  const_steps = steps - (accel_steps + decel_steps);
 
   total_steps = steps * 2;
   step_count = 0;
+  motion_phase = MOTION_ACCELERATING;
+
+  // Set direction
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, direction ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+  step_start_time = HAL_GetTick();
+
+  // Start PWM
+  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+  __HAL_TIM_SET_AUTORELOAD(&htim2, max_step_period - 1);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (max_step_period - 1) / 2);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+  // Sync TIM3 to same period
+  __HAL_TIM_SET_AUTORELOAD(&htim3, max_step_period - 1);
+  __HAL_TIM_SET_COUNTER(&htim3, 0);
+  HAL_TIM_Base_Start_IT(&htim3);
+
   isMoving = true;
 }
-
 uint32_t RPM_To_Period(uint32_t rpm)
 {
   // Use 1600 steps per revolution for 1/8 microstepping
@@ -152,33 +206,64 @@ uint32_t RPM_To_Period(uint32_t rpm)
   return timer_clk / (steps_per_sec * 2); // *2 for HIGH and LOW
 }
 
+uint32_t Calculate_Step_Period(uint32_t step_num)
+{
+  if (step_num < accel_steps) {
+    float progress = (float)step_num / accel_steps;
+    return max_step_period - (progress * (max_step_period - min_step_period));
+  } else if (step_num < (accel_steps + const_steps)) {
+    return min_step_period;
+  } else {
+    float progress = (float)(step_num - accel_steps - const_steps) / decel_steps;
+    return min_step_period + (progress * (max_step_period - min_step_period));
+  }
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM3 && isMoving)
   {
     step_count++;
 
-    // Toggle LED on each step (or at a different frequency if needed)
-	HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);  // Toggle the LED
+    // Check for soft stop request
+    if (isSoftStopRequested && motion_phase != MOTION_DECELERATING)
+    {
+      motion_phase = MOTION_DECELERATING;
 
-//    char msg[64];
-//    sprintf(msg, "Step %lu\r\n", step_count);
-//    HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+      // Immediately switch to deceleration from current step
+      decel_steps = total_steps - step_count;
+
+      // Clear accel and const phase counters to skip them
+      accel_steps = 0;
+      const_steps = 0;
+    }
 
     if (step_count >= total_steps)
     {
+      // Stop everything
       HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
       HAL_TIM_Base_Stop_IT(&htim3);
-
       isMoving = false;
+      isSoftStopRequested = false;
+      motion_phase = MOTION_IDLE;
 
       step_end_time = HAL_GetTick();
-      uint32_t elapsed = step_end_time - step_start_time;
-
       char done[64];
-      snprintf(done, sizeof(done), "Motion completed in %lu ms\r\n", elapsed);
+      snprintf(done, sizeof(done), "Motion completed in %lu ms\r\n", step_end_time - step_start_time);
       HAL_UART_Transmit(&huart2, (uint8_t *)done, strlen(done), HAL_MAX_DELAY);
+      return;
     }
+
+    // Compute the period for next step
+    uint32_t new_period = Calculate_Step_Period(step_count / 2);  // divide by 2 because each full step has 2 interrupts
+
+    // Update PWM and TIM3 period
+    __HAL_TIM_SET_AUTORELOAD(&htim2, new_period - 1);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (new_period - 1) / 2);
+    __HAL_TIM_SET_AUTORELOAD(&htim3, new_period - 1);
+
+    // Optional status LED
+    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
   }
 }
 
@@ -191,24 +276,19 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
   {
-//    HAL_UART_Transmit(&huart2, (uint8_t *)&rx_byte, 1, HAL_MAX_DELAY); // Echo back
-
     if (rx_byte == '\n' || rx_byte == '\r')
     {
-      rx_buffer[rx_index] = '\0'; // Null-terminate
-      Parse_Command(rx_buffer);
-      rx_index = 0;  // Reset buffer
+      rx_buffer[rx_index] = '\0';
+      command_ready = true;  // Flag it for main loop
+      rx_index = 0;
     }
     else
     {
       if (rx_index < sizeof(rx_buffer) - 1)
-      {
         rx_buffer[rx_index++] = rx_byte;
-      }
     }
 
-    // Restart reception for next byte
-    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1); // Always restart reception
   }
 }
 
